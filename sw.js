@@ -1,59 +1,128 @@
-const CACHE_NAME = 'novtl-cache-v1';
-const OFFLINE_URL = '/';
+const CACHE_VERSION = 'v2::' + self.crypto?.randomUUID?.() || Date.now();
+const STATIC_CACHE = `static-${CACHE_VERSION}`;
+const DYNAMIC_CACHE = `dynamic-${CACHE_VERSION}`;
 
-// Install Event: Skip Waiting agar SW baru langsung aktif
+const STATIC_ASSETS = [
+  '/',
+  '/index.html',
+  '/manifest.json',
+  '/icon-192.png',
+  '/icon-512.png',
+  '/icon.svg',
+  '/favicon.ico'
+];
+
+function log(...args) {
+  // toggle this to false to quiet the SW logs in production
+  const ENABLE_LOG = true;
+  if (ENABLE_LOG) console.log('[sw]', ...args);
+}
+
 self.addEventListener('install', (event) => {
+  log('install', CACHE_VERSION);
   self.skipWaiting();
-});
-
-// Activate Event: Claim Clients & Bersihkan Cache Lama
-self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((cacheNames) => {
-      return Promise.all(
-        cacheNames.map((cache) => {
-          if (cache !== CACHE_NAME) {
-            return caches.delete(cache);
-          }
-        })
-      );
-    }).then(() => self.clients.claim())
+    caches.open(STATIC_CACHE).then((cache) => {
+      return cache.addAll(STATIC_ASSETS);
+    })
   );
 });
 
-// Fetch Event: Network First Strategy
-// Kita mengutamakan Online. Cache hanya sebagai cadangan jika offline (untuk aset statis).
+self.addEventListener('activate', (event) => {
+  log('activate', CACHE_VERSION);
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(
+        keys
+          .filter((key) => key !== STATIC_CACHE && key !== DYNAMIC_CACHE)
+          .map((key) => {
+            log('deleting old cache', key);
+            return caches.delete(key);
+          })
+      )
+    ).then(() => self.clients.claim())
+  );
+});
+
+// helper to send message to all clients
+async function broadcastMessage(msg) {
+  const clientsList = await self.clients.matchAll({ includeUncontrolled: true });
+  for (const client of clientsList) {
+    client.postMessage(msg);
+  }
+}
+
+self.addEventListener('message', (event) => {
+  if (!event.data) return;
+  if (event.data.type === 'SKIP_WAITING') {
+    log('received SKIP_WAITING message');
+    self.skipWaiting();
+  }
+});
+
 self.addEventListener('fetch', (event) => {
-  // 1. JANGAN Cache Request selain GET (misal: POST ke API Gemini/OpenAI)
-  // Ini menjamin respons AI selalu fresh dan tidak salah cache.
-  if (event.request.method !== 'GET') {
+  // only handle GET requests
+  if (event.request.method !== 'GET') return;
+
+  const requestUrl = new URL(event.request.url);
+  const isSameOrigin = requestUrl.origin === self.location.origin;
+
+  // navigation requests (SPA) -> network-first, fallback to cache
+  if (event.request.mode === 'navigate' || (event.request.headers.get('accept') || '').includes('text/html')) {
+    event.respondWith(
+      fetch(event.request)
+        .then((res) => {
+          // update static cache with latest index.html
+          const copy = res.clone();
+          caches.open(STATIC_CACHE).then((cache) => cache.put('/index.html', copy));
+          return res;
+        })
+        .catch(() => caches.match('/index.html'))
+    );
     return;
   }
 
-  // 2. JANGAN Cache request ke Extension atau skema non-http
-  if (!event.request.url.startsWith('http')) {
+  // same-origin requests for static assets -> cache-first
+  if (isSameOrigin && STATIC_ASSETS.includes(requestUrl.pathname)) {
+    event.respondWith(
+      caches.match(event.request).then((cached) => cached || fetch(event.request).then((res) => {
+        const copy = res.clone();
+        caches.open(STATIC_CACHE).then((cache) => cache.put(event.request, copy));
+        return res;
+      }))
+    );
     return;
   }
 
+  // API or other requests -> network-first with dynamic caching
   event.respondWith(
     fetch(event.request)
-      .then((networkResponse) => {
-        // Jika berhasil ambil dari network, simpan salinannya ke cache (untuk jaga-jaga offline nanti)
-        // Pastikan response valid sebelum dicache
-        if (!networkResponse || networkResponse.status !== 200 || networkResponse.type !== 'basic') {
-          return networkResponse;
+      .then((response) => {
+        // optionally cache JSON responses for offline use
+        const contentType = response.headers.get('content-type') || '';
+        if (isSameOrigin && contentType.includes('application/json')) {
+          const copy = response.clone();
+          caches.open(DYNAMIC_CACHE).then((cache) => cache.put(event.request, copy));
         }
-
-        const responseToCache = networkResponse.clone();
-        caches.open(CACHE_NAME).then((cache) => {
-          cache.put(event.request, responseToCache);
-        });
-
-        return networkResponse;
+        return response;
       })
-      .catch(() => {
-        // Jika Network Gagal (Offline), coba cari di cache
-        return caches.match(event.request);
-      })
+      .catch(() => caches.match(event.request))
   );
 });
+
+// optional: cleanup dynamic cache size
+async function trimCache(cacheName, maxItems = 50) {
+  const cache = await caches.open(cacheName);
+  const keys = await cache.keys();
+  if (keys.length > maxItems) {
+    await cache.delete(keys[0]);
+    await trimCache(cacheName, maxItems);
+  }
+}
+
+// on update, broadcast new version so the page can prompt the user
+self.addEventListener('activate', (event) => {
+  event.waitUntil(broadcastMessage({ type: 'SW_UPDATED', version: CACHE_VERSION }));
+});
+
+// export nothing: service worker file
